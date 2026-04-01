@@ -30,9 +30,11 @@ import java.nio.charset.Charset
 
 class MainActivity : ComponentActivity() {
 
+    //variable para interactuar con el hardware NFC del telefono
     private var nfcAdapter: NfcAdapter? = null
+    // permite capturar el evento NFC antes que otras apps
     private var pendingIntent: PendingIntent? = null
-
+    //Estados para los mensajes
     private var messageToSend by mutableStateOf("")
     private var receivedMessage by mutableStateOf("")
     private var isSendMode by mutableStateOf(true)
@@ -40,9 +42,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-
+        //inicia el NFC
         nfcAdapter = NfcAdapter.getDefaultAdapter(this)
-
+        //se verifica que el telefono tenga NFC
         if (nfcAdapter == null) {
             Toast.makeText(this, "NFC no disponible", Toast.LENGTH_LONG).show()
         }
@@ -53,7 +55,7 @@ class MainActivity : ComponentActivity() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
         )
 
-        // Configurar el callback para cuando el mensaje sea enviado (leído por el receptor)
+        //configurar el callback para cuando el mensaje sea enviado (leído por el receptor)
         MyHostApduService.onMessageSent = {
             runOnUiThread {
                 if (messageToSend.isNotEmpty()) {
@@ -72,14 +74,14 @@ class MainActivity : ComponentActivity() {
                         messageToSend = messageToSend,
                         onMessageChange = { 
                             messageToSend = it
-                            // Actualizamos el mensaje en el servicio de emulacion
+                            //actualizamos el mensaje en el servicio de emulacion
                             MyHostApduService.messageToShare = it
                         },
                         receivedMessage = receivedMessage,
                         isSendMode = isSendMode,
                         onModeChange = { 
                             isSendMode = it 
-                            if (!it) receivedMessage = "" // Limpiar al cambiar a modo recibir
+                            if (!it) receivedMessage = ""
                         },
                         onSendClick = { 
                             if (messageToSend.isBlank()) {
@@ -97,19 +99,18 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Capturamos cualquier evento NFC
+        //capturamos cualquier evento NFC
         nfcAdapter?.enableForegroundDispatch(this, pendingIntent, null, null)
     }
 
     override fun onPause() {
         super.onPause()
+        //desactiva prioridad al salir de la app para no interferir con otros procesos
         nfcAdapter?.disableForegroundDispatch(this)
     }
-
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        
-        // Si estamos en modo RECIBIR, intentamos leer al otro telefono que estara emulando una tarjeta
+        //si estamos en modo recibir, intentamos leer al otro telefono que estara emulando una tarjeta
         if (!isSendMode) {
             val tag: Tag? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 intent.getParcelableExtra(NfcAdapter.EXTRA_TAG, Tag::class.java)
@@ -117,15 +118,13 @@ class MainActivity : ComponentActivity() {
                 @Suppress("DEPRECATION")
                 intent.getParcelableExtra(NfcAdapter.EXTRA_TAG)
             }
-            
             tag?.let { readFromEmulatedTag(it) }
         }
     }
 
     private fun readFromEmulatedTag(tag: Tag) {
         val isoDep = IsoDep.get(tag) ?: return
-
-        // Comando para seleccionar nuestro servicio (AID: F0010203040506)
+        //comando para seleccionar servicio (AID: F0010203040506)
         val selectCommand = byteArrayOf(
             0x00.toByte(), 0xA4.toByte(), 0x04.toByte(), 0x00.toByte(), 0x07.toByte(),
             0xF0.toByte(), 0x01.toByte(), 0x02.toByte(), 0x03.toByte(), 0x04.toByte(), 0x05.toByte(), 0x06.toByte()
@@ -133,13 +132,13 @@ class MainActivity : ComponentActivity() {
 
         try {
             isoDep.connect()
-            // Tiempo de espera un poco más largo para asegurar la lectura
+            //tiempo de espera para asegurar la lectura
             isoDep.timeout = 5000
             
-            // Enviamos el comando de seleccion al otro telefono
+            //envia comando de seleccion al otro telefono
             val response = isoDep.transceive(selectCommand)
             
-            // Verificamos si la respuesta termina en 0x90 0x00 (Exito)
+            //verifica si la respuesta termina en 0x90 0x00 (Significa que es exito)
             if (response.size >= 2 && response[response.size - 2] == 0x90.toByte() && response[response.size - 1] == 0x00.toByte()) {
                 val payload = response.copyOfRange(0, response.size - 2)
                 val text = String(payload, Charset.forName("UTF-8"))
@@ -283,23 +282,6 @@ fun NfcScreen(
                     )
                 }
             }
-
-            Spacer(modifier = Modifier.height(40.dp))
-
-            CircularProgressIndicator(
-                modifier = Modifier.size(60.dp),
-                color = mainBlue,
-                strokeWidth = 4.dp
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Text(
-                text = "Esperando señal NFC",
-                fontSize = 20.sp,
-                color = Color.Black
-            )
-
             Spacer(modifier = Modifier.weight(1f))
         }
     }
