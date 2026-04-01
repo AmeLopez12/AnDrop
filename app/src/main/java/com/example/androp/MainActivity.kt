@@ -2,12 +2,9 @@ package com.example.androp
 
 import android.app.PendingIntent
 import android.content.Intent
-import android.content.IntentFilter
-import android.nfc.NdefMessage
-import android.nfc.NdefRecord
 import android.nfc.NfcAdapter
 import android.nfc.Tag
-import android.nfc.tech.Ndef
+import android.nfc.tech.IsoDep
 import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
@@ -33,13 +30,9 @@ import java.nio.charset.Charset
 
 class MainActivity : ComponentActivity() {
 
-    //Adaptador NFC para interactuar con el hardware del telefono
     private var nfcAdapter: NfcAdapter? = null
-    //Intencion pendiente para manejar eventos NFC en primer plano
     private var pendingIntent: PendingIntent? = null
-    //Filtros para especificar que tipo de mensajes NFC queremos recibir
-    private var intentFiltersArray: Array<IntentFilter>? = null
-    //Estado para el mensaje a enviar y el mensaje recibido
+
     private var messageToSend by mutableStateOf("")
     private var receivedMessage by mutableStateOf("")
     private var isSendMode by mutableStateOf(true)
@@ -47,41 +40,55 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        //Inicializar el NfcAdapter
+
         nfcAdapter = NfcAdapter.getDefaultAdapter(this)
-        //Verificar si el dispositivo tiene NFC
+
         if (nfcAdapter == null) {
-            Toast.makeText(this, "NFC no esta disponible en este dispositivo", Toast.LENGTH_LONG).show()
-        } else if (!nfcAdapter!!.isEnabled) {
-            Toast.makeText(this, "NFC esta desactivado. Por favor, activalo en los ajustes.", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "NFC no disponible", Toast.LENGTH_LONG).show()
         }
-        //Preparar el PendingIntent para recibir intents NFC
+
         val intent = Intent(this, javaClass).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
         pendingIntent = PendingIntent.getActivity(
             this, 0, intent,
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
         )
-        //Configurar filtro para detectar mensajes NDEF de texto plano
-        val ndefFilter = IntentFilter(NfcAdapter.ACTION_NDEF_DISCOVERED).apply {
-            try {
-                addDataType("text/plain")
-            } catch (e: IntentFilter.MalformedMimeTypeException) {
-                throw RuntimeException("Fallo al añadir tipo MIME", e)
+
+        // Configurar el callback para cuando el mensaje sea enviado (leído por el receptor)
+        MyHostApduService.onMessageSent = {
+            runOnUiThread {
+                if (messageToSend.isNotEmpty()) {
+                    messageToSend = ""
+                    MyHostApduService.messageToShare = ""
+                    Toast.makeText(this, "¡Mensaje enviado con éxito!", Toast.LENGTH_SHORT).show()
+                }
             }
         }
-        intentFiltersArray = arrayOf(ndefFilter)
-        //Definicion de la interfaz de usuario con Compose
+
         setContent {
             AnDropTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     NfcScreen(
                         modifier = Modifier.padding(innerPadding),
                         messageToSend = messageToSend,
-                        onMessageChange = { messageToSend = it },
+                        onMessageChange = { 
+                            messageToSend = it
+                            // Actualizamos el mensaje en el servicio de emulacion
+                            MyHostApduService.messageToShare = it
+                        },
                         receivedMessage = receivedMessage,
                         isSendMode = isSendMode,
-                        onModeChange = { isSendMode = it },
-                        onSendClick = { prepareNfcMessage() }
+                        onModeChange = { 
+                            isSendMode = it 
+                            if (!it) receivedMessage = "" // Limpiar al cambiar a modo recibir
+                        },
+                        onSendClick = { 
+                            if (messageToSend.isBlank()) {
+                                Toast.makeText(this, "Escribe un mensaje primero", Toast.LENGTH_SHORT).show()
+                            } else {
+                                MyHostApduService.messageToShare = messageToSend
+                                Toast.makeText(this, "Modo Enviar activo. Acerca el otro teléfono.", Toast.LENGTH_SHORT).show()
+                            }
+                        }
                     )
                 }
             }
@@ -90,88 +97,70 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        //Habilitar la prioridad de la app para capturar señales NFC
-        nfcAdapter?.enableForegroundDispatch(this, pendingIntent, intentFiltersArray, null)
+        // Capturamos cualquier evento NFC
+        nfcAdapter?.enableForegroundDispatch(this, pendingIntent, null, null)
     }
 
     override fun onPause() {
         super.onPause()
-        //Deshabilitar la prioridad al pausar la actividad
         nfcAdapter?.disableForegroundDispatch(this)
     }
 
-    //Metodo que se ejecuta cuando se detecta una etiqueta o dispositivo NFC
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        //Manejar recepcion de datos
-        if (NfcAdapter.ACTION_NDEF_DISCOVERED == intent.action) {
-            val rawMsgs = intent.getParcelableArrayExtra(NfcAdapter.EXTRA_NDEF_MESSAGES)
-            if (rawMsgs != null) {
-                val msgs = arrayOfNulls<NdefMessage>(rawMsgs.size)
-                for (i in rawMsgs.indices) {
-                    msgs[i] = rawMsgs[i] as NdefMessage
-                }
-                displayReceivedData(msgs[0])
-            }
-        } else if (NfcAdapter.ACTION_TAG_DISCOVERED == intent.action && isSendMode) {
-            //Manejar envio de datos (Escritura)
+        
+        // Si estamos en modo RECIBIR, intentamos leer al otro telefono que estara emulando una tarjeta
+        if (!isSendMode) {
             val tag: Tag? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 intent.getParcelableExtra(NfcAdapter.EXTRA_TAG, Tag::class.java)
             } else {
                 @Suppress("DEPRECATION")
                 intent.getParcelableExtra(NfcAdapter.EXTRA_TAG)
             }
-            tag?.let { writeNdefMessage(it) }
+            
+            tag?.let { readFromEmulatedTag(it) }
         }
     }
 
-    //Avisar al usuario que debe acercar el dispositivo
-    private fun prepareNfcMessage() {
-        if (messageToSend.isBlank()) {
-            Toast.makeText(this, "Escribe un mensaje primero", Toast.LENGTH_SHORT).show()
-            return
-        }
-        Toast.makeText(this, "Acerca el otro dispositivo para enviar", Toast.LENGTH_SHORT).show()
-    }
+    private fun readFromEmulatedTag(tag: Tag) {
+        val isoDep = IsoDep.get(tag) ?: return
 
-    //Logica para grabar el mensaje en el dispositivo detectado
-    private fun writeNdefMessage(tag: Tag) {
-        val ndef = Ndef.get(tag)
-        if (ndef == null) {
-            Toast.makeText(this, "Este tag no soporta NDEF", Toast.LENGTH_SHORT).show()
-            return
-        }
-        //Crear registro NDEF con el texto
-        val record = NdefRecord.createTextRecord("es", messageToSend)
-        val message = NdefMessage(arrayOf(record))
+        // Comando para seleccionar nuestro servicio (AID: F0010203040506)
+        val selectCommand = byteArrayOf(
+            0x00.toByte(), 0xA4.toByte(), 0x04.toByte(), 0x00.toByte(), 0x07.toByte(),
+            0xF0.toByte(), 0x01.toByte(), 0x02.toByte(), 0x03.toByte(), 0x04.toByte(), 0x05.toByte(), 0x06.toByte()
+        )
+
         try {
-            ndef.connect()
-            if (!ndef.isWritable) {
-                Toast.makeText(this, "El tag es de solo lectura", Toast.LENGTH_SHORT).show()
-                return
+            isoDep.connect()
+            // Tiempo de espera un poco más largo para asegurar la lectura
+            isoDep.timeout = 5000
+            
+            // Enviamos el comando de seleccion al otro telefono
+            val response = isoDep.transceive(selectCommand)
+            
+            // Verificamos si la respuesta termina en 0x90 0x00 (Exito)
+            if (response.size >= 2 && response[response.size - 2] == 0x90.toByte() && response[response.size - 1] == 0x00.toByte()) {
+                val payload = response.copyOfRange(0, response.size - 2)
+                val text = String(payload, Charset.forName("UTF-8"))
+                
+                runOnUiThread {
+                    receivedMessage = text
+                    Toast.makeText(this, "¡Mensaje recibido!", Toast.LENGTH_SHORT).show()
+                }
             }
-            ndef.writeNdefMessage(message)
-            Toast.makeText(this, "Mensaje enviado correctamente", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
-            Toast.makeText(this, "Error al enviar: ${e.message}", Toast.LENGTH_SHORT).show()
+            runOnUiThread {
+                // Toast.makeText(this, "Error al recibir: ${e.message}", Toast.LENGTH_SHORT).show()
+            }
         } finally {
-            ndef.close()
-        }
-    }
-    //Decodificar el mensaje NDEF recibido
-    private fun displayReceivedData(ndefMessage: NdefMessage?) {
-        val record = ndefMessage?.records?.get(0)
-        val payload = record?.payload
-        if (payload != null) {
-            val languageCodeLength = payload[0].toInt() and 0x3F
-            val textEncoding = if ((payload[0].toInt() and 0x80) == 0) "UTF-8" else "UTF-16"
-            val text = String(payload, languageCodeLength + 1, payload.size - languageCodeLength - 1, Charset.forName(textEncoding))
-            receivedMessage = text
+            try {
+                isoDep.close()
+            } catch (_: Exception) {}
         }
     }
 }
 
-//Interfaz de usuario principal
 @Composable
 fun NfcScreen(
     modifier: Modifier = Modifier,
@@ -194,7 +183,6 @@ fun NfcScreen(
     ) {
         Spacer(modifier = Modifier.height(60.dp))
 
-        //Titulo de la app
         Text(
             text = "ANDROP",
             style = MaterialTheme.typography.displayLarge.copy(
@@ -203,6 +191,7 @@ fun NfcScreen(
                 fontSize = 60.sp
             )
         )
+
         Text(
             text = "Con NFC",
             style = MaterialTheme.typography.headlineSmall.copy(
@@ -210,8 +199,9 @@ fun NfcScreen(
                 color = Color.Black
             )
         )
+
         Spacer(modifier = Modifier.height(30.dp))
-        //Botones Enviar / Recibir
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.Center
@@ -230,9 +220,10 @@ fun NfcScreen(
                 selectedColor = lightBlue
             )
         }
+
         Spacer(modifier = Modifier.height(40.dp))
+
         if (isSendMode) {
-            //Cuadro para escribir mensaje
             OutlinedTextField(
                 value = messageToSend,
                 onValueChange = onMessageChange,
@@ -242,7 +233,7 @@ fun NfcScreen(
                     .border(1.dp, Color.Black, RoundedCornerShape(20.dp)),
                 placeholder = {
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Text("Mensaje a Enviar", textAlign = TextAlign.Center, color = Color.Black, fontSize = 24.sp)
+                        Text("Mensaje a Enviar", textAlign = TextAlign.Center, color = Color.Gray, fontSize = 24.sp)
                     }
                 },
                 shape = RoundedCornerShape(20.dp),
@@ -252,8 +243,9 @@ fun NfcScreen(
                 ),
                 textStyle = LocalTextStyle.current.copy(textAlign = TextAlign.Center, fontSize = 20.sp)
             )
+
             Spacer(modifier = Modifier.weight(1f))
-            //Boton para enviar
+
             Button(
                 onClick = onSendClick,
                 modifier = Modifier
@@ -267,14 +259,14 @@ fun NfcScreen(
             Spacer(modifier = Modifier.height(60.dp))
 
         } else {
-            //Cuadro de informacion recibida
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(200.dp)
                     .background(cardBackground, RoundedCornerShape(20.dp))
                     .border(1.dp, Color.Black, RoundedCornerShape(20.dp))
-                    .padding(16.dp)
+                    .padding(16.dp),
+                contentAlignment = Alignment.TopStart
             ) {
                 Column {
                     Text(
@@ -285,7 +277,7 @@ fun NfcScreen(
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = receivedMessage,
+                        text = if (receivedMessage.isEmpty()) "Esperando..." else receivedMessage,
                         fontSize = 18.sp,
                         color = Color.Black
                     )
@@ -293,24 +285,26 @@ fun NfcScreen(
             }
 
             Spacer(modifier = Modifier.height(40.dp))
-            //Indicador de carga
+
             CircularProgressIndicator(
                 modifier = Modifier.size(60.dp),
-                color = Color.Gray,
+                color = mainBlue,
                 strokeWidth = 4.dp
             )
+
             Spacer(modifier = Modifier.height(16.dp))
+
             Text(
                 text = "Esperando señal NFC",
                 fontSize = 20.sp,
                 color = Color.Black
             )
+
             Spacer(modifier = Modifier.weight(1f))
         }
     }
 }
 
-//Boton personalizado para cambiar de modo
 @Composable
 fun ModeButton(
     text: String,
